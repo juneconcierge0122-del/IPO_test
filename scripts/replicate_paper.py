@@ -33,8 +33,12 @@ DATA = "/home/ebenezer0616/IPO_test/data/us_panel.npz"
 ANN = 252
 
 
-def metrics(pred, actual, dates, stock_idx):
-    """pred/actual: 1-D aligned arrays; dates: day index per observation."""
+def metrics(pred, actual, dates, stock_idx, quantile=10):
+    """pred/actual: 1-D aligned arrays; dates: day index per observation.
+
+    quantile: cross-section split for the long-short (10 = deciles, the paper's choice;
+    small universes like TW50 pass 5 for quintiles so each leg still holds ~10 names).
+    """
     err = pred - actual
     r2 = 100 * (1 - (err ** 2).sum() / (actual ** 2).sum())
     if pred.std() == 0:
@@ -65,10 +69,10 @@ def metrics(pred, actual, dates, stock_idx):
     ls, lng, sht = [], [], []
     for d in np.unique(dates):
         m = dates == d
-        if m.sum() < 20:                       # need enough names for ten deciles
+        if m.sum() < 2 * quantile:             # need enough names for both extreme baskets
             continue
         p, a = pred[m], actual[m]
-        k = max(1, len(p) // 10)
+        k = max(1, len(p) // quantile)
         o = np.argsort(p)
         top, bot = a[o[-k:]].mean(), a[o[:k]].mean()
         ls.append(top - bot); lng.append(top); sht.append(-bot)
@@ -94,12 +98,18 @@ def metrics(pred, actual, dates, stock_idx):
             "pred_std": pred.std()}
 
 
-def build_windows(ex, valid, day_ids, ctx_len):
-    """Return (contexts [N, ctx_len], targets [N], day index [N], column index [N])."""
+def build_windows(ex, valid, day_ids, ctx_len, lag=1):
+    """Return (contexts [N, ctx_len], targets [N], day index [N], column index [N]).
+
+    lag=1 targets day t+1 (the paper's protocol). lag=2 skips a day and targets t+2:
+    the model's forecast is unchanged, so any drop in portfolio return between lag=1
+    and lag=2 measures the one-day microstructure component (bid-ask bounce and
+    short-term reversal harvested by daily rebalancing), not model skill.
+    """
     ctxs, tgts, dids, cols = [], [], [], []
     for t in day_ids:
         win = ex[t - ctx_len + 1: t + 1]                # context ends on day t
-        nxt = ex[t + 1]                                 # target is day t+1
+        nxt = ex[t + lag]                               # target day
         ok = np.isfinite(win).all(axis=0) & np.isfinite(nxt) & valid[t]
         if not ok.any():
             continue
@@ -144,6 +154,8 @@ def main():
                     help="exclude the bottom q of each day's size distribution, as the paper "
                          "does with market cap; dollar volume is the proxy used here")
     ap.add_argument("--num-samples", type=int, default=20, help="Chronos sampled paths")
+    ap.add_argument("--lag", type=int, default=1,
+                    help="target day t+lag; 2 = skip a day, isolating microstructure effects")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="/home/ebenezer0616/IPO_test/out/us_replication.csv")
     args = ap.parse_args()
@@ -177,10 +189,10 @@ def main():
     for ctx_len in args.windows:
         for year in range(y0, y1 + 1):
             day_ids = np.flatnonzero((dates.year == year))
-            day_ids = day_ids[(day_ids >= ctx_len - 1) & (day_ids < len(dates) - 1)]
+            day_ids = day_ids[(day_ids >= ctx_len - 1) & (day_ids < len(dates) - args.lag)]
             if len(day_ids) == 0:
                 continue
-            built = build_windows(ex, valid, day_ids, ctx_len)
+            built = build_windows(ex, valid, day_ids, ctx_len, lag=args.lag)
             if built is None:
                 continue
             C, T, D, _ = built
