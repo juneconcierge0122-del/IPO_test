@@ -1,302 +1,266 @@
-# FinText TSFM × IPO / 市場預測 — 交接文件
+# FinText TSFM 評估報告
 
-最後更新 2026-08-13。這份文件記錄 checkpoint 的性質、環境的坑、已完成的實驗與結論。
-新 session 從這裡讀起。
-
----
-
-## 0. 環境（一定要先讀）
-
-```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate fintext
-cd ~/IPO_test
-```
-
-conda env `fintext`：python 3.11 / torch 2.7.1+cu126 / transformers 4.51.3 /
-chronos-forecasting 1.5.2 / timesfm 1.2.7（`--no-deps`，只為了拿它的 torch decoder）。
-
-兩個**必須知道**的環境陷阱：
-
-1. **`~/.pip/pip.conf` 設了 `install.user = true`**。在 conda env 裡 `pip install` 會裝到
-   `~/.local/lib/pythonX.Y/site-packages`，而且那個 user-site 還會**滲透進 conda env**。
-   裝套件一律用：
-   ```bash
-   PIP_USER=0 PYTHONNOUSERSITE=1 ~/miniconda3/envs/fintext/bin/pip install ...
-   ```
-   env 已經設好 `PYTHONNOUSERSITE=1`（`conda env config vars`）。
-   `~/.local` 的 python3.12 那棵樹已經壞掉了（缺 joblib、torchao .so symbol error），別用。
-
-2. **CUDA driver 版本錯配**。kernel module 是 535.161.08，但
-   `/etc/ld.so.conf.d/00-cuda-compat.conf` 讓 `libcuda.so.1` 優先解析到
-   `/usr/local/cuda/compat/lib` 裡的 **595.58.03**，導致 context 建不起來
-   （`cuDevicePrimaryCtxRetain()=999`）。因為它在 ldconfig cache 裡，**清空
-   `LD_LIBRARY_PATH` 沒有用**，必須把真 driver 目錄放到最前面。
-   已寫進 `envs/fintext/etc/conda/activate.d/00-cuda-driver-fix.sh`：
-   ```bash
-   export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-   ```
-   `conda activate fintext` 後 V100 32GB 正常。**其他 env 和系統 python 沒修，會踩到同樣的雷。**
-
-GPU：Tesla V100-SXM2-32GB（sm_70，只用 float32）。
-
----
-
-## 0.5 論文協定（先讀，我的實驗有偏離）
+最後更新 2026-08-13。單一事實來源：實驗結論以本文件為準，`out/` 下只保留有效結果
+（作廢的在 `out/archive/`，附說明）。
 
 論文：Rahimikia, Ni & Wang, *Re(Visiting) Time Series Foundation Models in Finance*,
-arXiv:**2511.18578**（2025-11）。它定義了這些 checkpoint 的正確用法：
-
-- **excess return = 含息日總報酬 − 當地日無風險利率**，`r_ex = (S_t + D_t − S_{t−1})/S_{t−1} − r_f`。
-  **不是市場調整**。（本專案 `--returns exrf` 就是這個。）
-- **模型是 one-step-ahead**：學的是 `P(r_ex_{t+1} | r_ex_{t−C+1..t})`，點預測取
-  條件**期望值（樣本平均）**，不是中位數。
-- 論文研究的 window 是 5 / 21 / 252 / 512 天，**window 越長越準**；釋出的 ckpt context_len = 512。
-- `Augmented` = **JKP-augmented** = 全球超額報酬 + Jensen-Kelly-Pedersen (2023) 的 153 個因子。
-  **不是合成資料**。（論文提到兩種 augmented，但 HF 只發佈一種，無法確定是哪個。）
-- 論文自己的成績：Chronos-small 從頭訓練在 window 512 是 **R²_oos = −0.59%**、方向正確率
-  ~51.7%；經濟結果（年化 36.84%、Sharpe 5.42）來自**每日再平衡的橫斷面 long-short、
-  用次日預測、且未計交易成本**。
-
-> **⚠️ 因此：R²_oos 為負是預期中的，不是失敗。** 本文件 §3 裡「沒有模型的 R²_oos > 0」
-> 這件事本身不構成負面結論 —— 要看的是它跟 −0.59% 這個基準比起來如何。
-
-> **⚠️ 我的實驗偏離協定兩處**：(1) 用 30 步 / 20 步 horizon，而非 1 步；
-> (2) Chronos 取樣本**中位數**而非平均。所以 §3.1 / §3.2 的結果**不是對模型能力的裁決**，
-> 只是對「在這個非標準設定下能不能用」的回答。要下結論請照協定重跑。
-
-## 1. FinText checkpoint 的真相
-
-HuggingFace `FinText/*` 共 **360 個 repo**：
-
-| 家族 | 尺寸 | 年份 | 變體 |
-|---|---|---|---|
-| TimesFM | 8M / 20M | 2000–2023 | Global / US / Augmented |
-| Chronos | Tiny / Mini / Small(46M) | 2000–2023 | Global / US / Augmented |
-
-- **年份 = 訓練截止點**（資料 1990→該年）。測 Y 年就用 `min(2023, Y-1)` 的 ckpt。
-- 訓練資料是 **excess return**，餵報酬序列，不要餵價格。
-- `Global` = 全球、`US` = 美股、`Augmented` = 資料增強。
-
-已下載到 HF cache（`~/.cache/huggingface/hub`）：TimesFM_20M 與 Chronos_Small 的
-2007–2023 × 3 變體共 102 個，加上零星 2023/2019 的其他尺寸。
-
-### 1.1 TimesFM 載入方式（重要）
-
-`config.json` 寫 `architectures: ["TimesFMForHF"]`，但 **transformers 沒有這個類別**，
-repo 裡也沒附 modeling 程式碼。實際權重就是 google-research `timesfm` 1.x 的
-`PatchedTimeSeriesDecoder`，只多一層 `model.` prefix。loader 在
-`scripts/fintext_tsfm.py`，`strict=True` 完全對上。
-
-參數：`patch_len=32`、`context_len=512`、`horizon_len=128`、
-`use_positional_embedding=True`（實測比 False 誤差低）。
-
-### 1.2 已知的 checkpoint 缺陷
-
-| 問題 | 證據 | 影響 |
-|---|---|---|
-| **quantile head 壞掉** | 9 個分位數單調比例 **0%**，值到 ±3.0（日報酬 300%） | 只能用 channel 0（point head）；要分布請用 Chronos |
-| **`self_attn.scaling` 是未初始化記憶體** | 掃過的 35 個 TimesFM ckpt 有 **29 個**最大值到 1e27~1e38，對照 `qkv_proj.weight` std≈0.03 正常。只有 `TimesFM_20M_2019_Global`、`TimesFM_8M_2023_Global` 看起來真的訓練過 | `load_timesfm(fix_scaling=True)`（預設）把它歸零，`softplus(0)=ln2=1/1.442695`，還原成標準 `1/sqrt(head_dim)`。**context < 64 天時無影響**（見 1.3） |
-| **`TimesFM_20M_*_Augmented` 數值發散** | 30 天 context 下 blowup（\|預測日報酬\|>50%）達 **15~96%**，R²_oos 到 −1.9 萬 % | 排除，或至少 clip |
-
-### 1.3 TimesFM 的 patch 退化（實驗設計的關鍵限制）
-
-`patch_len=32`，所以 context 少於 32 天時只有 **1 個有效 patch**，attention 的 softmax 對
-單一位置做 = 恆等於 1，**9 層 transformer 退化成一個 MLP**。實測：
-
-| context | 有效 patch | 擾動 scaling 參數對輸出的影響 |
-|---|---|---|
-| 30 天 | **1/16** | **0.0000** |
-| 64 天 | 2/16 | 0.4380 |
-| 128 天 | 4/16 | 0.4892 |
-| 256 天 | 8/16 | 0.4239 |
-
-**任何 context < 64 天的 TimesFM 結果都不能解讀成「模型能力不足」** —— 它根本沒在運作。
-Chronos 沒這個問題（逐時點 token，30 天 = 30 個 token）。
-
-### 1.4 兩個模型的原始輸出
-
-**TimesFM**：`forward()` → `(B, 16 patches, 128 steps, 10 channels)`。
-channel 0 = point，1~9 = q10~q90。單位與輸入相同（前處理用 context 的 mean/std 標準化，
-輸出反轉回來）。`decode()` 取最後一個 patch 的前 H 步；H≤128 時**不需自迴歸**。
-
-**Chronos**：T5 語言模型，把報酬量化成 token（4093 個 bin 均勻切在 mean-scaled 的
-[−15,+15]；實測 1 bin ≈ 0.018% 日報酬、可表達 ±36.5%，解析度不是瓶頸）。
-`predict()` → `(B, num_samples, H)`，是**同一條序列的 N 條可能路徑**（不是 N 檔股票），
-點預測是你自己取的統計量。因此它的分位數必然單調 —— 這是它勝過 TimesFM 的結構性原因。
+arXiv:2511.18578。checkpoint：huggingface.co/FinText（360 個 = {TimesFM 8M/20M,
+Chronos Tiny/Mini/Small} × 訓練截止年 2000–2023 × {Global, US, Augmented}）。
 
 ---
 
-## 2. 資料
+## 0. Metric 定義
 
-| 用途 | 來源 | 檔案 |
+單位一律是**超額報酬** = 含息日總報酬 − 當日無風險利率
+（`r_ex = (S_t + D_t − S_{t−1})/S_{t−1} − r_f`，論文的定義；**不是**減市場報酬）。
+
+**R²_OOS**（Gu et al. 2020）：
+
+```
+R²_OOS = 1 − Σ(實際 − 預測)² / Σ(實際)²
+```
+
+分子 = 預測誤差平方和；分母 = 「一律預測 0」的誤差平方和。衡量「比猜 0 好多少」，
+>0 才算有預測力。基準用 0 而非歷史平均，因為個股歷史平均雜訊太大，用它會讓爛模型顯得好。
+**在日頻個股報酬上，R²_OOS 為負是常態**：論文自己最好的成績也只有 −0.59%。
+
+**多頭腳／空頭腳**：每個交易日把當天所有股票依**預測值**排序，取 k = n/10：
+
+```
+多頭腳_d = (預測最高 k 檔的實際超額報酬總和) / k        ← 買進
+空頭腳_d = −(預測最低 k 檔的實際超額報酬總和) / k       ← 放空（負號=股票跌則賺）
+多空_d   = 多頭腳_d + 空頭腳_d
+```
+
+排序用預測值、計酬用實際值；等權重、每日再平衡、不計交易成本。
+
+**年化與 Sharpe**：
+
+```
+年化 = mean(多空_d) × 252
+Sharpe = mean(多空_d) / std(多空_d) × √252
+```
+
+多空是零成本自融資部位，本身已是超額報酬，不再減 r_f。
+
+**IC**（IPO 實驗用）：預測累積報酬 vs 實際累積報酬的橫斷面 Spearman 相關。
+
+---
+
+## 1. 先驗證模型本身（美股複現）
+
+### 1.1 兩個家族的輸入／輸出
+
+| | TimesFM (20M) | Chronos (Small, 46M) |
 |---|---|---|
-| 台股還原股價 | finlab | `~/finlab_db/etl#adj_close.feather`（4719 天 × 2759 檔，2007-04-23→2026-07-03） |
-| 上市/上櫃日期 | TWSE + TPEx openapi | `build_tw_ipo_panel.py` 內建抓取 |
-| 無風險利率 | **央行金融業隔夜拆款利率** | `data/overnight.csv`（Big5 需 iconv）+ `data/gap_*.html` 補到今天 |
+| 架構 | patched decoder，9 層 | T5 seq2seq，報酬量化成 token |
+| 輸入 | 過去 C 日超額報酬，**32 天切一個 patch** | 過去 C 日超額報酬，**每天一個 token** |
+| 輸出 | `(B, 16 patch, 128 步, 10 通道)`；ch0=點預測、ch1–9=分位數 | `(B, num_samples, H)`：同一序列的 N 條抽樣路徑 |
+| 點預測 | ch0 | 抽樣路徑的**平均**（論文取條件期望） |
+| 分位數 | **壞掉**（單調比例 0%） | 由抽樣得到，必然單調 |
 
-**無風險利率別用重貼現率**：重貼現率是政策利率（1.125~2.0%），實際隔夜拆款只有
-0.08~0.83%，差一個量級（台灣銀行間結構性資金寬鬆）。取得方式見 `scripts/tw_riskfree.py`
-docstring。CSV 只更新到 2026-03-18，之後用 CBC 的分頁 HTML 補。
+模型是 **one-step-ahead**：學的是 `P(r_{t+1} | r_{t−C+1..t})`。載入方式見
+`scripts/fintext_tsfm.py`（TimesFM 的 `TimesFMForHF` 不是 transformers 類別，
+實際權重是 google timesfm 1.x 的 `PatchedTimeSeriesDecoder` 加 `model.` prefix）。
 
-### 2.1 IPO panel
+### 1.2 `self_attn.scaling` 未初始化記憶體 — 是什麼問題
 
-`scripts/build_tw_ipo_panel.py` → `data/tw_ipo_panel.npz`（908 檔，2008–2026）。
-IPO 日 = 面板中第一個非 NaN 日（與 TWSE/TPEx 上市日中位數差 0 天、93% 在 7 天內）。
-篩選：4 碼純數字（排除 ETF `00xx`、TDR `91xx`、權證）、2008-07 之後上市（避開左設限）、
-首日價 ≥ 1 元、前 61 個交易日跨度 ≤ 150 天。
+掃過 35 個 TimesFM ckpt，**29 個**的 `self_attn.scaling` 最大值落在 1e27–1e38，
+帶重複位元組樣式與其他張量的殘留值（layernorm 的 ≈1.0、linear 的 ≈0.01）
+→ 這是 `torch.empty()` 配置後**從未被訓練寫入**的記憶體，不是權重。
 
-存了四種報酬定義（`ctx_*` / `hor_*`，各 30 天）：
+為什麼理論上嚴重：forward 計算 `q × 1.442695/√d × softplus(scaling)`，
+softplus(1e38)≈1e38 會讓 attention logits 爆掉。
+為什麼實際影響小：`softplus(0) = ln2 = 1/1.442695`，歸零剛好還原標準 `1/√d` scaling，
+而多數 entry 的有效值本來就近 0；實測歸零前後正弦波 MAE 只差 0.6314→0.6343。
+loader 預設 `fix_scaling=True` 歸零處理。
 
-| key | 定義 | 與 `ret` 相關 | 平均絕對差 |
+**結論：釋出的權重不乾淨（訓練 pipeline 沒存這個參數），但不是結果失效的原因。**
+另外 context < 32 天時只有 1 個 patch、attention softmax 恆等於 1，這個參數完全無作用
+（實測擾動影響 = 0.0000）—— 也因此 **context < 32 天的 TimesFM 是一個退化成 MLP 的模型**，
+任何短 context 結果都不能解讀為模型能力。
+
+### 1.3 有問題的 checkpoint
+
+| checkpoint | 症狀 | 處置 |
+|---|---|---|
+| `TimesFM_20M_2023_Augmented` | 預測日報酬平均 \|0.85\|（實際~0.013）、逐層 hidden 200–640 vs 同族 ~4 | **排除** |
+| 全部 `TimesFM_*_Augmented` | 預測 std 0.010–0.043 vs 實際 0.03–0.04：自信地猜錯，R² 到 −223% | 標註校準失敗 |
+| 全部 TimesFM | quantile head 單調比例 0% | 只用 ch0 |
+| 全部 TimesFM | §1.2 的 scaling 問題 | `fix_scaling=True` |
+
+（論文提到 JKP-augmented 與 synthetic-augmented 兩種增強，HF 只發佈一種 `Augmented`，
+無法確定對應哪個 —— 論文說增強對 TimesFM 幫助最大，與我們觀察到的相反。）
+
+### 1.4 複現設計
+
+- **固定**：horizon = 1 天（照協定）。逐年 point-in-time：測 Y 年用 min(2023, Y−1) 的 ckpt
+- **變動**：context C ∈ {5, 21, 252, 512}
+- 每個 (C, 年份, 模型) 算 R²_OOS、方向準確率、十分位多空
+
+### 1.5 測試資料（如實標註）
+
+- 來源：yfinance（snapshot **2026-08-13**），`nasdaqtraded.txt` 過濾 ETF/測試股/權證後的共普通股
+- 無風險利率：Ken French 日頻 RF（與論文 CRSP 系列同源）
+- 測試期間：2017-01-01 ~ 2023-12-31
+- **⚠️ 資料缺陷（重要）**：下載被 Yahoo 限流，實得 **973 檔**且依字母截斷
+  （A 331 / B 187 / C 268 佔 81%，**N–Z 完全沒有**）。先前文件寫的「3,886 檔」是錯的。
+  首字母與報酬應無系統關聯，可視為 ~25% 的準隨機子樣本，但每個十分位只剩 ~80 檔
+  → 十分位報酬雜訊放大。**不能宣稱代表美股市場。**
+- **存活者偏誤**：yfinance 無下市股票，會系統性美化空頭腳（論文用 CRSP 含下市報酬）
+
+### 1.6 複現結果
+
+TimesFM_20M_US（973 檔子集、剔除成交金額後 5%、2017–2023 七年合計）：
+
+| context | R²_OOS | 方向準確率 | 多空年化 | Sharpe | 多頭腳 | 空頭腳 | 論文對照 |
+|---|---|---|---|---|---|---|---|
+| 5 | −28.2% | 49.3% | −42.4% | −1.62 | −0.2% | −42.2% | 年化 −18.22% |
+| 21 | −14.1% | 49.9% | +13.6% | 0.68 | +24.0% | −10.4% | — |
+| 252 | −21.0% | 49.9% | +50.1% | 2.31 | +46.2% | +3.9% | — |
+| **512** | **−3.9%** | **50.6%** | **+64.0%** | **3.06** | **+58.3%** | **+5.7%** | **+30.36% / Sharpe 3.66** |
+
+**✅ 論文核心型態重現成功**：
+1. context 越長越好的單調關係（Sharpe −1.62 → 0.68 → 2.31 → 3.06）
+2. 兩個端點正負號與論文一致（5 天賠錢、512 天賺錢）
+3. 多頭腳主導（58.3 vs 5.7），與論文 "long leg consistently outperforms short leg" 一致
+
+（注意 C=5, 21 的 TimesFM 處於 §1.2 的 patch 退化區間，論文的 −18.22% 也在同一區間，
+所以連「短 context 很爛」這件事本身都復現了 —— 但那是退化行為，不是模型能力。）
+
+Chronos_Small_US（流動性前 500 檔、window 512，7 年跑完 6 年，最後一年進行中）：
+
+| 年份 | R²_OOS | 多空年化 | Sharpe |
 |---|---|---|---|
-| `ret` | `(P_t − P_{t−1} + 股利) / P_{t−1}`（adj_close 已含股利） | — | — |
-| **`exrf`** | `ret − 日無風險利率` ← **FinText 的定義** | **1.00000** | 0.000066 |
-| `exmkt` | `ret − 橫斷面中位數報酬` | 0.95507 | 0.005350 |
-| `retpt` | 分母改用 `P_t` | 0.99644 | 0.001073 |
+| 2017 | −0.54% | −2.6% | −0.27 |
+| 2018 | −0.63% | −5.0% | −0.43 |
+| 2019 | −0.76% | −17.8% | −1.37 |
+| 2020 | −4.50% | −15.4% | −0.53 |
+| 2021 | (跑完補) | | |
+| 2022 | −0.65% | −14.6% | −0.55 |
 
-**`exrf` 實質上等於原始總報酬**（日無風險 0.007%，日報酬 std 3.3%）。真正有差別的是 `exmkt`。
+**Chronos 的 R²_OOS 幾乎命中論文的 −0.59%，但在流動性前 500 檔上多空報酬全負。**
+同一協定下 TimesFM 從 973 檔全樣本（Sharpe 3.06）換到前 500 檔也大幅衰退。
+→ 多空報酬來自**排名 500–973 的較不流動股票**。
+（先前描述為「3,886 vs 500」是錯的；實際對比只有 973 vs 其中前 500。）
+
+### 1.7 兩個未結案的疑點
+
+1. **多頭腳 +58%/年 可能是微結構假象**：等權重＋每日再平衡＋收盤價會機械性吃到
+   買賣價差跳動與短期反轉，低價小型股尤甚。檢驗方式：預測目標從 t+1 改 t+2（跳一天），
+   大幅衰減即證實。**未跑。**
+2. **逐年 vs 合併推論**：把多個測試年混在一起算相關會吸收「年度之間」的成分，
+   系統性高估（台股上已證實會翻轉結論，見 §3）。美股目前是逐年算的，安全；
+   但 ckpt 2020 逐年測 2021/2022/2023 vs 合併 2021–23 的正式對照**未跑**。
 
 ---
 
-## 3. 實驗與結論
+## 2. 美股 IPO（前 30 天 → 後 30 天）— 未執行
 
-### 3.1 IPO setup A：前 30 天 → 後 30 天（`run_experiment.py`）
-
-881 檔、17 個 point-in-time cohort（2009–2025）。指標見腳本 docstring。
-
-**核心結果 — 報酬定義決定結論**：
-
-| 模型 | `exmkt` IC (t) | **`exrf` IC (t)** | 正 IC 年份 (exrf) |
-|---|---|---|---|
-| Chronos_Small_Augmented | 0.139 (3.39) | **0.061 (1.50)** | 53% |
-| Chronos_Small_Global | 0.087 (1.81) | **0.074 (2.05)** | 76% |
-| Chronos_Small_US | 0.069 (1.86) | **0.079 (2.71)** | 71% |
-| TimesFM_20M_Global | −0.019 (−0.45) | −0.071 (−1.55) | 35% |
-| TimesFM_20M_US | −0.032 (−0.89) | −0.068 (−1.41) | 29% |
-| baseline:momentum | 0.012 (0.26) | −0.037 (−0.68) | 35% |
-
-> **最初報告的「Chronos IC 0.142、t=3.24」大半是市場調整造成的假象。**
-> 改用 FinText 自己的定義（`exrf`）後只剩 `Chronos_Small_US` t=2.71 撐住，
-> 而這是 6 個變體中挑出來的 → Bonferroni 後 p≈0.09，**不顯著**。
-> 目前的立場應該是：**IPO 上沒有證實的訊號**。
-
-其他：
-- 沒有任何模型的 R²_oos > 0（Chronos_Small_US 最接近，−0.6%）。**注意這其實正好落在論文
-  自報的 −0.59% 上**（見 §0.5），所以不是失敗訊號。
-- TimesFM 全滅，但受限於 1.3 的 patch 退化，**這不是公平比較**。
-
-### 3.2 大盤 walk-forward（`market_backtest.py`）
-
-0050，context 512 天、horizon 20 天、每 5 天重測；14 個 ckpt 年 × 各自後續所有年份。
-TimesFM 在這裡有 16 個 patch 全滿，是公平比較。
-
-**(a) 擇時完全打不贏買進持有** —— 配對檢定（每個 ckpt 年一個觀測）：
-
-| 模型 | 擇時 − B&H | 勝場 | p |
-|---|---|---|---|
-| Chronos_Small_Global | −2.65pp | 2/14 | 0.000 |
-| Chronos_Small_US | −4.43pp | 1/13 | 0.001 |
-| TimesFM_20M_Global | −4.83pp | 2/14 | 0.003 |
-| TimesFM_20M_US | −3.56pp | 2/14 | 0.022 |
-
-模型 **64~100% 的時間都在看多**，二值化的「持有/空手」規則把連續訊號的資訊丟光了。
-（曾經看到 2021 ckpt 去均值規則 Sharpe 2.01，攤開 14 個 ckpt 年後是 **0~1 勝、落後
-10~14pp**，確認是事後挑規則的假象。）
-
-**(b) 但方向性有微弱真訊號** —— 預測 vs 實際 20 日累積報酬的 Spearman：
-
-| 模型 | 平均 corr | t | 正值年份 |
-|---|---|---|---|
-| Chronos_Small_Global | +0.114 | 3.85 | 13/14 |
-| Chronos_Small_US | +0.093 | 3.92 | 11/13 |
-| TimesFM_20M_Global | +0.053 | 3.84 | 11/14 |
-| TimesFM_20M_US | +0.052 | 2.92 | 12/14 |
-
-四個都顯著為正，**Chronos 約為 TimesFM 的兩倍**，且這是在 TimesFM 的主場測的。
-
-**(c) ckpt 新舊沒有差別**：corr vs 模型年齡 rho = +0.02~+0.13，全部不顯著（p 0.13~0.81）。
-2010 年的 ckpt 測 2026 跟 2023 年的 ckpt 測 2026 一樣好。
-同一測試年、跨 ckpt 年的 corr 標準差（0.09~0.29）**大於模型平均 corr（0.11）**
-→ 「哪一年測試」的影響遠大於「用哪個 ckpt」。point-in-time 選 ckpt 是防 look-ahead 的
-必要衛生，但別期待新 ckpt 比較準。
-
-### 3.3 美股：照論文協定複現（`build_us_panel.py` / `replicate_paper.py`）
-
-這是**唯一照論文協定跑的實驗**（1 步 horizon、條件期望、十分位每日再平衡多空）。
-資料：yfinance 3,886 檔現存美股共普通股、2014-06→2023-12，無風險利率用 Ken French
-日頻 RF。測試年 2017–2023，逐年 point-in-time。
-
-**(a) TimesFM_20M_US，全市場（剔除成交金額後 5%），window 掃描：**
-
-| window | R²_OOS | acc | 年化 LS | Sharpe | 論文 |
-|---|---|---|---|---|---|
-| 5 | −28.2% | 49.31% | −42.4% | −1.62 | −18.22% |
-| 21 | −14.1% | 49.86% | +13.6% | 0.69 | — |
-| 252 | −21.0% | 49.95% | +50.1% | 2.31 | — |
-| **512** | **−3.9%** | **50.58%** | **+64.0%** | **3.06** | **+30.36% / Sharpe 3.66** |
-
-**論文的核心型態重現成功**：window 越長越好的單調關係、以及「5 天為負、512 天為正」
-的兩個端點都對上。絕對值偏高，與存活者偏誤方向一致（yfinance 沒有已下市股票，
-而下市的多半最差 → 系統性美化空頭腳）。
-
-> ⚠️ 但依 §1.3，window 5 / 21 的 TimesFM 處於 patch 退化區間。論文自己的 −18.22%
-> 也在同一區間，所以我重現到的是**同一個假象**，不是模型在短視窗下的真實能力。
-
-**(b) 效益全部來自小型／低流動性股票** —— 同樣 window 512、同樣協定，只把宇宙
-換成流動性前 500 檔：
-
-| 模型 | 宇宙 | R²_OOS | 年化 LS | Sharpe |
-|---|---|---|---|---|
-| TimesFM_20M_US | 全市場 ~3.9k | −3.9% | +64.0% | 3.06 |
-| TimesFM_20M_US | 前 500 檔 | −0.9~−6.7% | −28~+31% | −0.72~2.32 |
-| Chronos_Small_US | 前 500 檔 | **−0.54~−0.76%** | **−2.6~−17.8%** | −0.27~−1.37 |
-
-**Chronos 的 R² 幾乎完美命中論文的 −0.59%，但多空報酬是負的。** 換句話說，
-統計面複現得很好，經濟面在大型股上完全不成立。這跟論文自述「小型股可預測性較高」
-一致，但反過來說：**論文那個 Sharpe 5.42 依賴的正是流動性最差、交易成本最高的那一段**。
-Chronos 全市場尚未跑（3.9k 檔 × 7 年 ≈ 17 GPU 小時），是最該補的一塊。
-
-**(c) `Augmented` 是校準壞掉、不是檔案壞掉**：預測日報酬 std 0.010~0.043，
-而實際 std 約 0.03~0.04；US/Global 只有 0.004~0.013。也就是它「很有自信地猜錯」，
-R²_OOS 被打到 −223%。正弦波健檢下 17 個年份只有 2023 真的發散，其餘數值正常。
+現有 973 檔 panel 中各年新上市（以 panel 首個有效報酬日認定）：
+2015: 27、2016: 17、2017: 31、2018: 37、2019: 28、2020: 47、2021: 103、2022: 28。
+單年最多 103 檔 → 十分位不可行，只能做 IC 或三分位。
+30 天 context 對 TimesFM 是退化區間（§1.2），需同時做 60→30 版本才公平。
 
 ---
 
-## 4. 檔案地圖
+## 3. 台股大盤（0050 擇時）
+
+資料：`~/finlab_db/etl#adj_close.feather`（snapshot **2026-07-04**，4719 天 × 2759 檔，
+2007-04-23 → 2026-07-03，本地完整）。無風險利率：央行**隔夜拆款利率**
+（`scripts/tw_riskfree.py`；別用重貼現率，差一個量級）。
+
+設計：context 512 → horizon 20，每 5 天重測；14 個 ckpt 年 × 各自之後所有測試年。
+這裡 TimesFM 有 16 個 patch 全滿，是對它公平的比較。
+
+**(a) 擇時打不贏買進持有**：四個模型都輸 2.7–4.8pp（p 0.000–0.022，14 年只贏 1–2 年）。
+模型 59–64% 時間看多，二值化持有/空手把訊號丟光。
+
+**(b) 方向性訊號（已修正）** — 預測 vs 實際 20 日累積報酬的 Spearman，
+**逐年計算、按 ckpt 年聚合**：
+
+| 模型 | corr | t | 正值 ckpt 年 |
+|---|---|---|---|
+| Chronos_Small_Global | **+0.079** | +2.57 | 10/14 |
+| Chronos_Small_US | **+0.053** | +2.32 | 9/13 |
+| TimesFM_20M_Global | **−0.074** | −5.27 | **0/14** |
+| TimesFM_20M_US | −0.077 | −3.90 | 1/14 |
+
+> ⚠️ 本文件前一版寫「四個模型都顯著為正」，**是錯的** —— 那是用
+> `market_backtest.csv` 裡 `test_year="ALL"` 的混合列算的（把該 ckpt 所有年份的預測
+> 混在一起算相關，吸收了年度間成分：TimesFM 混合 +0.053 → 逐年 **−0.074**）。
+> 交易在特定時點發生，吃不到跨年度水準差異，逐年才有意義。
+> **修正後結論：台股大盤上 Chronos 有微弱正向方向訊號，TimesFM 是顯著反向。**
+
+**(c) ckpt 新舊無差別**：corr vs 模型年齡全部不顯著（p 0.13–0.81）；
+同一測試年跨 ckpt 的 corr 標準差（0.09–0.29）大於平均 corr（0.11）。
+point-in-time 是防 look-ahead 的衛生要求，不是準確度來源。
+
+**尚未做**：台股權值股**橫斷面十分位多空**（對得上論文協定的那種）。0050 擇時
+不是論文的用法，論文的經濟效益全部來自橫斷面。
+
+---
+
+## 4. 台股 IPO（前 30 天 → 後 30 天）— 已完成
+
+881 檔（2009–2025）、17 個 point-in-time cohort，`out/results_exrf.csv`。
+
+| 模型 | IC | t | 正 IC 年份 |
+|---|---|---|---|
+| Chronos_Small_US | 0.079 | 2.71 | 71% |
+| Chronos_Small_Global | 0.074 | 2.05 | 76% |
+| Chronos_Small_Augmented | 0.061 | 1.50 | 53% |
+| TimesFM_20M_Global | −0.071 | −1.55 | 35% |
+| TimesFM_20M_US | −0.068 | −1.41 | 29% |
+| baseline:momentum | −0.037 | −0.68 | 35% |
+
+**結論：沒有證實的訊號。**
+- 唯一撐住的 Chronos_Small_US 是 6 個變體挑出來的 → Bonferroni 後 p≈0.09
+- 最初報告的「IC 0.14、t=3.2」來自誤用市場調整報酬（`out/archive/`），已作廢
+- TimesFM 全負但處於 patch 退化區間（§1.2），**不是公平比較**；需 60→30 版本
+- 台股 IPO 另有漲跌停、承銷制度等因素，模型未見過
+
+---
+
+## 5. 環境（操作前必讀）
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate fintext && cd ~/IPO_test
+```
+
+1. **pip 陷阱**：`~/.pip/pip.conf` 設了 `install.user=true`，conda env 裡裝套件一律
+   `PIP_USER=0 PYTHONNOUSERSITE=1 ...`。env 已設 `PYTHONNOUSERSITE=1`。
+2. **CUDA 陷阱**：kernel driver 535 vs compat lib 595 錯配，
+   `activate.d/00-cuda-driver-fix.sh` 已把 `/usr/lib/x86_64-linux-gnu` 前置。
+   其他 env / 系統 python 沒修。
+3. GPU：V100-SXM2-32GB（sm_70，float32）。TimesFM 推論 ~10k 筆/秒；
+   Chronos ~110 筆/秒（20 樣本）是瓶頸。
+
+## 6. 檔案地圖
 
 ```
 scripts/
-  fintext_tsfm.py         loader：load_timesfm() / load_chronos()（含 fix_scaling）
-  tw_riskfree.py          央行隔夜拆款利率 → 日無風險利率
+  fintext_tsfm.py         loader（fix_scaling、短 context 處理）
+  tw_riskfree.py          央行隔夜拆款 → 日無風險利率
   build_tw_ipo_panel.py   台股 IPO panel（四種報酬定義）
-  run_experiment.py       IPO setup A 逐年評估（--returns exrf|exmkt|ret|retpt）
-  market_backtest.py      大盤 walk-forward（ckpt 年 × 測試年）
-  inspect_raw_output.py   兩個家族的原始輸出解剖
-  smoke_test.py           ckpt 載入 + 推論健檢
-  check_signal_source.py  IC 是否只是動能（寫好但未跑）
-  build_us_panel.py       美股 panel（非本線產出，未驗證）
-  replicate_paper.py      美股橫斷面實驗（非本線產出，未驗證）
+  build_us_panel.py       美股 panel（⚠️ 有限流問題，見 §1.5）
+  run_experiment.py       台股 IPO 逐年評估（--returns exrf）
+  replicate_paper.py      美股論文協定複現
+  market_backtest.py      台股 0050 walk-forward（⚠️ 輸出含 test_year="ALL" 混合列，勿直接用）
+  其他                    健檢與解剖工具
 out/
-  results_exrf.csv        ★ IPO 主結果（FinText 定義）
-  results_exmkt.csv       IPO 對照（減市場）
-  results_by_year.csv     最初那版（減市場，已被 exrf 推翻）
-  market_backtest.csv     ★ 大盤全表
+  results_exrf.csv        ★ 台股 IPO 主結果
+  results_exmkt.csv       台股 IPO 對照（減市場，用於展示定義敏感性）
+  market_backtest.csv     ★ 台股 0050 全表（聚合時先濾掉 test_year=="ALL"）
+  us_timesfm.csv          ★ 美股 TimesFM 複現（973 檔子集）
+  us_chronos.csv          美股 Chronos 前 500 檔（進行中）
+  archive/                作廢結果 + 說明
 ```
 
----
+## 7. 下一步
 
-## 5. 下一步的候選
-
-依重要性排序：
-
-1. **先照協定重跑**（§0.5）：1 步 horizon、Chronos 取樣本**平均**而非中位數。現有 §3 全部
-   結果都是非標準設定，不能拿來評價模型。這是所有後續工作的前提。
-2. **IPO setup 60→30**：讓 TimesFM 至少有 2 個 patch，才是對它公平的比較。目前 IPO 那組
-   TimesFM 全滅的結論**不可引用**。
-3. **`check_signal_source.py`** 已寫好未跑：IC 是否只是動能的偽裝（rank 空間殘差化）。
-   在 `exrf` 定義下跑，才知道剩下的那點訊號是什麼。
-4. **大盤改用連續部位**：既然方向有訊號但二值化後消失，試 `position ∝ 預測值`
-   或分位數分層，看訊號能不能轉成收益。論文的經濟結果也是橫斷面 long-short，不是擇時。
-5. **交易成本**：目前全部結果都是**稅前、零成本**（論文也是）。台股 IPO 流動性差又有
-   漲跌停，T3−T1 那幾個百分點很可能吃不到。
-6. 若要下結論寫報告，記得 §3.1 的多重檢定問題（6 個變體 × 4 種報酬定義）。
+1. t+2 檢驗（§1.7-1，成本極低）— 判斷 Sharpe 3.06 的多頭腳是否微結構假象
+2. 逐年 vs 合併的美股正式對照（§1.7-2）
+3. 台股權值股橫斷面十分位多空（§3，對齊論文協定）
+4. 美股 IPO（§2）與台股 IPO 60→30 補測（§4）
+5. 若要更強的美股宇宙：重寫 `build_us_panel.py` 加退避重試 + 覆蓋率驗證 + 原子寫入
