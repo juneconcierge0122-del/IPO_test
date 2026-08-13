@@ -1,0 +1,11 @@
+# Regenerable data (21MB+): rebuild with build_tw_ipo_panel.py / build_us_panel.py
+data/
+models/
+
+# Run logs — noisy (progress bars) and regenerable
+out/*.log
+out/*.pid
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
