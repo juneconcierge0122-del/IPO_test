@@ -66,12 +66,15 @@ def metrics(pred, actual, dates, stock_idx, quantile=10):
     # decile long-short, equal weighted, rebalanced daily.
     # rf cancels in the zero-cost spread, so the LS series is the same whether it is built
     # from excess or raw returns; the individual legs are excess returns (rf does not cancel).
-    ls, lng, sht = [], [], []
+    from scipy import stats as _st
+    ls, lng, sht, ics = [], [], [], []
     for d in np.unique(dates):
         m = dates == d
         if m.sum() < 2 * quantile:             # need enough names for both extreme baskets
             continue
         p, a = pred[m], actual[m]
+        if p.std() > 1e-12:
+            ics.append(_st.spearmanr(p, a).statistic)   # daily cross-sectional rank IC
         k = max(1, len(p) // quantile)
         o = np.argsort(p)
         top, bot = a[o[-k:]].mean(), a[o[:k]].mean()
@@ -93,6 +96,10 @@ def metrics(pred, actual, dates, stock_idx, quantile=10):
             "LS_ann_%": ann, "LS_sharpe": shp, "LS_std_%": sd, "LS_bps_day": bps,
             "LS_maxdd_%": mdd, "LS_maxdd1d_%": dd1,
             "LS_skew": float(pd.Series(ls).skew()), "LS_kurt": float(pd.Series(ls).kurt()),
+            "IC_mean": float(np.mean(ics)) if ics else np.nan,
+            "IC_t": float(np.mean(ics) / (np.std(ics, ddof=1) / np.sqrt(len(ics))))
+                    if len(ics) > 1 and np.std(ics, ddof=1) > 0 else np.nan,
+            "IC_pos_%": 100 * float(np.mean(np.array(ics) > 0)) if ics else np.nan,
             "long_ann_%": perf(lng)[0], "long_sharpe": perf(lng)[1],
             "short_ann_%": perf(sht)[0], "short_sharpe": perf(sht)[1],
             "pred_std": pred.std()}
@@ -158,9 +165,12 @@ def main():
                     help="target day t+lag; 2 = skip a day, isolating microstructure effects")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="/home/ebenezer0616/IPO_test/out/us_replication.csv")
+    ap.add_argument("--data", default=DATA,
+                    help="panel npz; pass data/us_panel_973broken.npz to reproduce the "
+                         "973-ticker mixed-cap runs on the identical universe")
     args = ap.parse_args()
 
-    d = np.load(DATA, allow_pickle=True)
+    d = np.load(args.data, allow_pickle=True)
     dates = pd.to_datetime(d["dates"])
     ex = d["exret"].astype(np.float64)
     dv = d["dollar_vol"]

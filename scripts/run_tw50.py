@@ -33,6 +33,10 @@ def main():
     ap.add_argument("--families", nargs="+", default=["TimesFM_20M", "Chronos_Small"])
     ap.add_argument("--variants", nargs="+", default=["US"])
     ap.add_argument("--num-samples", type=int, default=20)
+    ap.add_argument("--ckpt-dir", default=None,
+                    help="local checkpoint root {dir}/{year}/ instead of the HF repos "
+                         "(for the fintext.ai Synthetic checkpoints); the path must contain "
+                         "'TimesFM' or 'Chronos' so predict() picks the right loader")
     ap.add_argument("--lag", type=int, default=1)
     ap.add_argument("--quantile", type=int, default=5,
                     help="cross-section split; 5 = quintiles (10 stocks per leg)")
@@ -79,7 +83,8 @@ def main():
                          **metrics(np.zeros_like(T), T, D, None, quantile=args.quantile)})
             for fam in args.families:
                 for var in args.variants:
-                    repo = f"FinText/{fam}_{ck}_{var}"
+                    repo = (f"{args.ckpt_dir}/{ck}" if args.ckpt_dir
+                            else f"FinText/{fam}_{ck}_{var}")
                     try:
                         P = predict(repo, C.astype(np.float32), args.device, args.num_samples)
                     except Exception as e:  # noqa: BLE001
