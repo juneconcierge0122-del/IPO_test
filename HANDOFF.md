@@ -139,9 +139,19 @@ tw50：
 
 台股 IPO：TimesFM_Syn IC +0.016 / Chronos_Syn IC −0.059 — 仍無訊號。
 
-三個要點：(a) **同市場同變體的論文對照，差距 <0.02** — 第二次量級精確複現；
+美股（補齊四宇宙）：
+| @512 | R²_OOS | 年化 | Sharpe | IC |
+|---|---|---|---|---|
+| SPY500 × TimesFM_Syn | −35.9% | −0.6% | **−0.04** | 0.006 |
+| SPY500 × Chronos_Syn | −1.6% | +3.0% | 0.18 | 0.009 |
+| US IPO × TimesFM_Syn | −25.7% | +20.7% | 0.98 | +0.032 |
+| US IPO × Chronos_Syn | −2.0% | +17.8% | 0.84 | +0.086 |
+
+四個要點：(a) **同市場同變體的論文對照（tw50），差距 <0.02** — 第二次量級精確複現；
 (b) Synthetic 沒有比 US 變體強（tw50 @512：TimesFM 0.98 vs US 版 2.01）；
-(c) Synthetic 校準正常，反襯 HF Augmented（JKP）的匯出異常。
+(c) Synthetic 校準正常（Chronos_Syn R² −1.6%），反襯 HF Augmented（JKP）的匯出異常；
+(d) **論文自稱美國最強的 TimesFM-Synthetic 在 S&P 500 上 Sharpe −0.04** —
+    四個變體在大型股上無一存活，「效益只在中小型股」對所有變體閉環。
 
 ---
 

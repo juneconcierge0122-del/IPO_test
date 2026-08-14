@@ -31,6 +31,9 @@ def main():
     ap.add_argument("--families", nargs="+", default=["TimesFM_20M", "Chronos_Small"])
     ap.add_argument("--variants", nargs="+", default=["US"])
     ap.add_argument("--num-samples", type=int, default=20)
+    ap.add_argument("--ckpt-dir", default=None,
+                    help="local checkpoint root {dir}/{year}/ (fintext.ai Synthetic); the "
+                         "path must contain 'TimesFM' or 'Chronos' for loader dispatch")
     ap.add_argument("--lag", type=int, default=1)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="/home/ebenezer0616/IPO_test/out/sp500_results.csv")
@@ -70,7 +73,8 @@ def main():
                          "n_members": len(cols), **metrics(np.zeros_like(T), T, D, None)})
             for fam in args.families:
                 for var in args.variants:
-                    repo = f"FinText/{fam}_{ck}_{var}"
+                    repo = (f"{args.ckpt_dir}/{ck}" if args.ckpt_dir
+                            else f"FinText/{fam}_{ck}_{var}")
                     try:
                         P = predict(repo, C, args.device, args.num_samples)
                     except Exception as e:  # noqa: BLE001
